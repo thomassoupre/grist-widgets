@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recherche dans les PDF — Widget Grist</title>
+<script src="https://docs.getgrist.com/grist-plugin-api.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/vue/3.4.21/vue.global.prod.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.0/tesseract.min.js"></script>
+<style>
+  :root {
+    --accent: #16b378;      /* vert Grist */
+    --ink: #262633;
+    --muted: #8a8a99;
+    --line: #e8e8ee;
+    --bg: #f7f7fa;
+    --hl: rgba(255, 213, 0, .45);
+    --hl-current: rgba(255, 140, 0, .55);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+  }
+  [v-cloak] { display: none; }
+  #app { display: flex; flex-direction: column; height: 100vh; }
+
+  .bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px;
+    background: #fff; border-bottom: 1px solid var(--line);
+    flex: 0 0 auto;
+  }
+  .bar input {
+    flex: 1; min-width: 60px;
+    padding: 7px 10px;
+    border: 1px solid var(--line); border-radius: 6px;
+    font: inherit; outline: none;
+  }
+  .bar input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(22,179,120,.15); }
+  .nav { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+  .nav button {
+    width: 28px; height: 28px;
+    border: 1px solid var(--line); border-radius: 6px;
+    background: #fff; color: var(--ink);
+    font-size: 15px; cursor: pointer;
+  }
+  .nav button:hover { border-color: var(--accent); color: var(--accent); }
+  .nav .count { font-variant-numeric: tabular-nums; color: var(--muted); padding: 0 4px; }
+  .muted { color: var(--muted); white-space: nowrap; }
+
+  .tabs {
+    display: flex; gap: 6px; overflow-x: auto;
+    padding: 6px 10px;
+    background: #fff; border-bottom: 1px solid var(--line);
+    flex: 0 0 auto;
+  }
+  .tabs button {
+    border: 1px solid var(--line); border-radius: 14px;
+    background: #fff; color: var(--ink);
+    padding: 3px 10px; font: inherit; font-size: 12px;
+    cursor: pointer; white-space: nowrap;
+  }
+  .tabs button.active { border-color: var(--accent); background: rgba(22,179,120,.08); color: #0d7a52; }
+  .tabs em { font-style: normal; color: var(--accent); font-weight: 600; }
+
+  .viewer { flex: 1 1 auto; overflow: auto; padding: 12px; }
+  .page {
+    position: relative;
+    margin: 0 auto 12px;
+    background: #fff;
+    box-shadow: 0 1px 4px rgba(0,0,0,.12);
+  }
+  .page canvas { display: block; }
+  .overlay { position: absolute; inset: 0; pointer-events: none; }
+  .hl { position: absolute; background: var(--hl); border-radius: 2px; }
+  .hl-current { background: var(--hl-current); outline: 2px solid #ff8c00; }
+
+  .status {
+    flex: 0 0 auto;
+    padding: 6px 10px;
+    color: var(--muted); background: #fff; border-top: 1px solid var(--line);
+  }
+</style>
+</head>
+<body>
+<div id="app" v-cloak>
+  <header class="bar">
+    <input
+      v-model="query"
+      type="search"
+      placeholder="Rechercher dans les PDF de la ligne…"
+      @keydown.enter.exact.prevent="next"
+      @keydown.enter.shift.prevent="prev"
+    >
+    <div class="nav" v-if="matches.length">
+      <button @click="prev" title="Résultat précédent (Maj+Entrée)">‹</button>
+      <span class="count">{{ current + 1 }} / {{ matches.length }}</span>
+      <button @click="next" title="Résultat suivant (Entrée)">›</button>
+    </div>
+    <span v-else-if="queryNorm && ready" class="muted">Aucun résultat</span>
+  </header>
+
+  <nav class="tabs" v-if="docsMeta.length > 1">
+    <button
+      v-for="(d, i) in docsMeta" :key="i"
+      :class="{ active: i === activeDoc }"
+      @click="setDoc(i)"
+    >{{ d.name }} <em v-if="d.matchCount">· {{ d.matchCount }}</em></button>
+  </nav>
+
+  <main ref="viewer" class="viewer"></main>
+
+  <div class="status" v-if="status">{{ status }}</div>
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+const { createApp, ref, watch, nextTick } = Vue;
+
+// Données lourdes hors de la réactivité Vue (les proxys ralentissent PDF.js).
+const store = { docs: [], pageEls: [] };
+
+// Normalisation : minuscules, sans accents, sans aucun espace.
+function normChar(c) {
+  return c.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+}
+function normString(s) {
+  let out = '';
+  for (const c of s) {
+    if (/\s/.test(c)) continue;
+    out += normChar(c);
+  }
+  return out;
+}
+
+createApp({
+  setup() {
+    const status = ref('En attente de la sélection d’une ligne…');
+    const ready = ref(false);
+    const docsMeta = ref([]);          // [{ name, matchCount }]
+    const activeDoc = ref(0);
+    const query = ref('');
+    const queryNorm = ref('');
+    const matches = ref([]);           // [{ doc, page, ranges }]
+    const current = ref(-1);
+    const viewer = ref(null);
+
+    let loadSeq = 0, renderSeq = 0, debounceT = null, resizeT = null;
+
+    // ---------- Grist ----------
+    grist.ready({
+      requiredAccess: 'full',
+      columns: [{ name: 'pdfs', title: 'PDF (pièces jointes)', type: 'Attachments' }],
+    });
+
+    grist.onRecord((record) => {
+      const mapped = grist.mapColumnNames(record);
+      if (!mapped) {
+        status.value = 'Choisissez la colonne de pièces jointes dans les options du widget.';
+        return;
+      }
+      let ids = mapped.pdfs;
+      if (!Array.isArray(ids)) ids = [];
+      if (ids[0] === 'L') ids = ids.slice(1);
+      loadDocs(ids);
+    });
+
+    // ---------- Chargement des PDF ----------
+    async function loadDocs(ids) {
+      const seq = ++loadSeq;
+      store.docs = [];
+      store.pageEls = [];
+      docsMeta.value = [];
+      matches.value = [];
+      current.value = -1;
+      activeDoc.value = 0;
+      ready.value = false;
+      if (viewer.value) viewer.value.innerHTML = '';
+
+      if (!ids.length) {
+        status.value = 'Aucune pièce jointe sur cette ligne.';
+        return;
+      }
+      status.value = 'Chargement des PDF…';
+
+      try {
+        const tok = await grist.docApi.getAccessToken({ readOnly: true });
+        store.docKey = tok.baseUrl; // pour un cache OCR propre à ce document Grist
+        for (const id of ids) {
+          if (seq !== loadSeq) return;
+          try {
+            const meta = await (await fetch(
+              `${tok.baseUrl}/attachments/${id}?auth=${tok.token}`
+            )).json();
+            const name = (meta && meta.fileName) || `Pièce jointe ${id}`;
+            if (!/\.pdf$/i.test(name)) continue; // on ignore les non-PDF
+            const pdf = await pdfjsLib.getDocument({
+              url: `${tok.baseUrl}/attachments/${id}/download?auth=${tok.token}`,
+            }).promise;
+            const pages = await extractPages(pdf);
+            store.docs.push({ pdf, pages, attId: id });
+            docsMeta.value.push({ name, matchCount: 0 });
+          } catch (e) {
+            console.warn('Pièce jointe ignorée', id, e);
+          }
+        }
+        if (seq !== loadSeq) return;
+        if (!store.docs.length) {
+          status.value = 'Aucun PDF trouvé dans cette colonne pour la ligne sélectionnée.';
+          return;
+        }
+        status.value = '';
+        ready.value = true;
+        await renderDoc(0);
+        if (queryNorm.value) runSearch();
+        // OCR côté client pour les pages scannées (sans couche texte).
+        await runOcrPass(seq);
+        if (seq === loadSeq && queryNorm.value) runSearch();
+      } catch (e) {
+        console.error(e);
+        status.value = 'Erreur : ' + e.message;
+      }
+    }
+
+    // Extraction du texte + index normalisé (avec table de correspondance).
+    async function extractPages(pdf) {
+      const pages = [];
+      for (let p = 1; p <= pdf.numPages; p++) {
+        const page = await pdf.getPage(p);
+        const tc = await page.getTextContent();
+        const items = tc.items
+          .filter((it) => it.str && it.str.trim())
+          .map((it) => ({ kind: 't', str: it.str, transform: it.transform, width: it.width }));
+        const pg = { items, norm: '', map: [], needsOcr: false };
+        indexPage(pg);
+        // Page (quasi) sans couche texte → probablement un scan : OCR nécessaire.
+        pg.needsOcr = pg.norm.length < 20;
+        pages.push(pg);
+      }
+      return pages;
+    }
+
+    function indexPage(pg) {
+      let norm = '';
+      const map = []; // pour chaque caractère normalisé : { item, offset }
+      pg.items.forEach((it, i) => {
+        const s = it.str;
+        for (let j = 0; j < s.length; j++) {
+          if (/\s/.test(s[j])) continue;
+          const n = normChar(s[j]);
+          for (const _ of n) map.push({ item: i, offset: j });
+          norm += n;
+        }
+      });
+      pg.norm = norm;
+      pg.map = map;
+    }
+
+    // ---------- OCR (Tesseract.js — 100 % dans le navigateur) ----------
+    let ocrWorker = null;
+    async function getOcrWorker() {
+      if (!ocrWorker) {
+        status.value = 'Initialisation de l’OCR (téléchargement du modèle fra+eng)…';
+        ocrWorker = await Tesseract.createWorker('fra+eng');
+      }
+      return ocrWorker;
+    }
+
+    function ocrCacheKey(attId) {
+      // v2 : invalide les caches créés avant la détection d'orientation.
+      return 'gristPdfOcr:v2:' + (store.docKey || '') + ':' + attId;
+    }
+    function readOcrCache(attId) {
+      try { return JSON.parse(localStorage.getItem(ocrCacheKey(attId)) || 'null'); }
+      catch { return null; }
+    }
+    function writeOcrCache(attId, data) {
+      try { localStorage.setItem(ocrCacheKey(attId), JSON.stringify(data)); }
+      catch (e) { console.warn('Cache OCR indisponible (quota ?)', e); }
+    }
+
+    async function runOcrPass(seq) {
+      for (let di = 0; di < store.docs.length; di++) {
+        const doc = store.docs[di];
+        const todo = doc.pages.map((pg, i) => (pg.needsOcr ? i : -1)).filter((i) => i >= 0);
+        if (!todo.length) continue;
+        const cache = readOcrCache(doc.attId) || { pages: {} };
+        let dirty = false;
+        for (const pi of todo) {
+          if (seq !== loadSeq) return;
+          const pg = doc.pages[pi];
+          const cached = cache.pages[pi + 1];
+          if (cached) {
+            pg.items = cached;
+          } else {
+            const name = docsMeta.value[di] ? docsMeta.value[di].name : '';
+            status.value = `OCR en cours : ${name} — page ${pi + 1}/${doc.pdf.numPages}…`;
+            pg.items = await ocrPage(doc.pdf, pi + 1);
+            cache.pages[pi + 1] = pg.items;
+            dirty = true;
+          }
+          pg.needsOcr = false;
+          indexPage(pg);
+        }
+        if (dirty) writeOcrCache(doc.attId, cache);
+      }
+      if (seq === loadSeq) status.value = '';
+    }
+
+    async function ocrPage(pdf, pageNum) {
+      const worker = await getOcrWorker();
+      const page = await pdf.getPage(pageNum);
+      const vp1 = page.getViewport({ scale: 1 });
+      // Rendu haute résolution (~1600 px de large) pour un OCR fiable.
+      const scale = Math.min(Math.max(1600 / vp1.width, 1.5), 3);
+      const vp = page.getViewport({ scale });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.floor(vp.width);
+      canvas.height = Math.floor(vp.height);
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+
+      // Certains scans sont tournés (paysage scanné en portrait…) : on essaie
+      // plusieurs orientations et on garde la meilleure. Arrêt anticipé dès
+      // qu'un résultat est bon, pour ne pas ralentir les pages normales.
+      const W = canvas.width, H = canvas.height;
+      let best = null;
+      for (const deg of [0, 90, 270, 180]) {
+        if (deg) status.value = status.value.replace(/ \(orientation.*$/, '') + ` (orientation ${deg}°…)`;
+        const src = deg ? rotateCanvas(canvas, deg) : canvas;
+        const { data } = await worker.recognize(src);
+        const words = (data.words || []).filter((w) => w.text.trim() && w.confidence >= 30);
+        const score = words.reduce((a, w) => a + w.confidence, 0);
+        if (!best || score > best.score) best = { deg, words, score, conf: data.confidence || 0 };
+        if (best.conf >= 70 && best.words.length >= 5) break; // orientation trouvée
+      }
+
+      return best.words.map((w) => {
+        const b = unrotateBBox(w.bbox, best.deg, W, H);
+        return {
+          kind: 'o',
+          str: w.text.trim(),
+          // Coordonnées ramenées à l'échelle 1 (origine en haut à gauche).
+          bbox: { x0: b.x0 / scale, y0: b.y0 / scale, x1: b.x1 / scale, y1: b.y1 / scale },
+        };
+      });
+    }
+
+    // Copie du canvas tournée de deg degrés (sens horaire).
+    function rotateCanvas(src, deg) {
+      const c = document.createElement('canvas');
+      const ctx = c.getContext('2d');
+      if (deg === 180) {
+        c.width = src.width; c.height = src.height;
+        ctx.translate(src.width, src.height); ctx.rotate(Math.PI);
+      } else {
+        c.width = src.height; c.height = src.width;
+        if (deg === 90) { ctx.translate(src.height, 0); ctx.rotate(Math.PI / 2); }
+        else { ctx.translate(0, src.width); ctx.rotate(-Math.PI / 2); }
+      }
+      ctx.drawImage(src, 0, 0);
+      return c;
+    }
+
+    // Reprojette une bbox du canvas tourné vers le canvas d'origine (W×H).
+    function unrotateBBox(b, deg, W, H) {
+      const pts = [[b.x0, b.y0], [b.x1, b.y1]].map(([xr, yr]) => {
+        if (deg === 90) return [yr, H - xr];
+        if (deg === 270) return [W - yr, xr];
+        if (deg === 180) return [W - xr, H - yr];
+        return [xr, yr];
+      });
+      return {
+        x0: Math.min(pts[0][0], pts[1][0]), y0: Math.min(pts[0][1], pts[1][1]),
+        x1: Math.max(pts[0][0], pts[1][0]), y1: Math.max(pts[0][1], pts[1][1]),
+      };
+    }
+
+    // ---------- Rendu ----------
+    async function renderDoc(i) {
+      const seq = ++renderSeq;
+      const el = viewer.value;
+      if (!el) return;
+      el.innerHTML = '';
+      store.pageEls = [];
+      const doc = store.docs[i];
+      if (!doc) return;
+
+      const cw = Math.max(el.clientWidth - 24, 200);
+      const dpr = window.devicePixelRatio || 1;
+
+      for (let p = 1; p <= doc.pdf.numPages; p++) {
+        if (seq !== renderSeq) return;
+        const page = await doc.pdf.getPage(p);
+        const scale = cw / page.getViewport({ scale: 1 }).width;
+        const vp = page.getViewport({ scale });
+
+        const wrap = document.createElement('div');
+        wrap.className = 'page';
+        wrap.style.width = vp.width + 'px';
+        wrap.style.height = vp.height + 'px';
+
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.floor(vp.width * dpr);
+        canvas.height = Math.floor(vp.height * dpr);
+        canvas.style.width = vp.width + 'px';
+        canvas.style.height = vp.height + 'px';
+
+        const overlay = document.createElement('div');
+        overlay.className = 'overlay';
+
+        wrap.append(canvas, overlay);
+        el.appendChild(wrap);
+        store.pageEls[p] = { vp, overlay };
+
+        await page.render({
+          canvasContext: canvas.getContext('2d'),
+          viewport: vp,
+          transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : null,
+        }).promise;
+      }
+      applyHighlights();
+    }
+
+    // ---------- Recherche ----------
+    watch(query, () => {
+      clearTimeout(debounceT);
+      debounceT = setTimeout(runSearch, 250);
+    });
+
+    function runSearch() {
+      queryNorm.value = normString(query.value);
+      computeMatches();
+      if (matches.value.length) goTo(0);
+      else { current.value = -1; applyHighlights(); }
+    }
+
+    function computeMatches() {
+      const q = queryNorm.value;
+      const res = [];
+      store.docs.forEach((doc, di) => {
+        let count = 0;
+        if (q) {
+          doc.pages.forEach((pg, pi) => {
+            let from = 0;
+            for (;;) {
+              const k = pg.norm.indexOf(q, from);
+              if (k === -1) break;
+              res.push({ doc: di, page: pi + 1, ranges: rangesFrom(pg.map, k, q.length) });
+              count++;
+              from = k + 1;
+            }
+          });
+        }
+        if (docsMeta.value[di]) docsMeta.value[di].matchCount = count;
+      });
+      matches.value = res;
+    }
+
+    // Regroupe les caractères d’une occurrence en plages par item de texte.
+    function rangesFrom(map, start, len) {
+      const ranges = [];
+      let cur = null;
+      for (let k = start; k < start + len; k++) {
+        const c = map[k];
+        if (!c) break;
+        if (cur && cur.item === c.item) cur.end = c.offset;
+        else {
+          if (cur) ranges.push(cur);
+          cur = { item: c.item, start: c.offset, end: c.offset };
+        }
+      }
+      if (cur) ranges.push(cur);
+      return ranges;
+    }
+
+    // ---------- Surlignage ----------
+    function applyHighlights() {
+      store.pageEls.forEach((pe) => pe && (pe.overlay.innerHTML = ''));
+      const doc = store.docs[activeDoc.value];
+      if (!doc) return;
+      matches.value.forEach((m, idx) => {
+        if (m.doc !== activeDoc.value) return;
+        const pe = store.pageEls[m.page];
+        const pg = doc.pages[m.page - 1];
+        if (!pe || !pg) return;
+        m.ranges.forEach((r) => {
+          const it = pg.items[r.item];
+          if (!it) return;
+          const len = Math.max(it.str.length, 1);
+          let left, top, width, height;
+          if (it.kind === 'o') {
+            // Mot issu de l'OCR : bbox en unités échelle 1, origine haut-gauche.
+            const s = pe.vp.scale;
+            const w = (it.bbox.x1 - it.bbox.x0) * s;
+            left = it.bbox.x0 * s + w * (r.start / len);
+            width = Math.max(w * ((r.end - r.start + 1) / len), 3);
+            top = it.bbox.y0 * s;
+            height = (it.bbox.y1 - it.bbox.y0) * s;
+          } else {
+            // Item de la couche texte native du PDF.
+            const tx = pdfjsLib.Util.transform(pe.vp.transform, it.transform);
+            const fh = Math.hypot(tx[2], tx[3]) || 10;
+            const w = it.width * pe.vp.scale;
+            left = tx[4] + w * (r.start / len);
+            width = Math.max(w * ((r.end - r.start + 1) / len), 3);
+            top = tx[5] - fh;
+            height = fh * 1.2;
+          }
+          const h = document.createElement('div');
+          h.className = 'hl' + (idx === current.value ? ' hl-current' : '');
+          h.style.left = left + 'px';
+          h.style.top = top + 'px';
+          h.style.width = width + 'px';
+          h.style.height = height + 'px';
+          pe.overlay.appendChild(h);
+        });
+      });
+    }
+
+    function scrollToCurrent() {
+      const el = viewer.value && viewer.value.querySelector('.hl-current');
+      if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+
+    // ---------- Navigation ----------
+    async function goTo(idx) {
+      if (!matches.value.length) return;
+      current.value = ((idx % matches.value.length) + matches.value.length) % matches.value.length;
+      const m = matches.value[current.value];
+      if (m.doc !== activeDoc.value) {
+        activeDoc.value = m.doc;
+        await renderDoc(m.doc); // applyHighlights inclus
+      } else {
+        applyHighlights();
+      }
+      await nextTick();
+      scrollToCurrent();
+    }
+    const next = () => goTo(current.value + 1);
+    const prev = () => goTo(current.value - 1);
+
+    async function setDoc(i) {
+      if (i === activeDoc.value) return;
+      activeDoc.value = i;
+      await renderDoc(i);
+    }
+
+    // Re-rendu à la taille près (redimensionnement du widget).
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeT);
+      resizeT = setTimeout(() => renderDoc(activeDoc.value), 300);
+    });
+
+    return {
+      status, ready, docsMeta, activeDoc, query, queryNorm,
+      matches, current, viewer, next, prev, setDoc,
+    };
+  },
+}).mount('#app');
+</script>
+</body>
+</html>
